@@ -281,6 +281,10 @@ def download_portuguese_subtitle(
 
 
 def main() -> None:
+    # Títulos com emoji quebram o console do Windows (cp1252).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     url = sys.argv[1].strip() if len(sys.argv) > 1 else input(
         "Cole o link do YouTube: "
     ).strip()
