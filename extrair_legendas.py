@@ -12,8 +12,20 @@ import yt_dlp
 
 OUTPUT_DIR = Path("legendas")
 
-# Prioridade: português brasileiro, português europeu e português genérico.
-PORTUGUESE_LANGUAGES = [ "pt"]
+# Idioma das legendas quando o usuário não escolhe outro.
+DEFAULT_LANGUAGE = "pt"
+
+# Variantes preferidas quando o idioma pedido é genérico, nesta ordem.
+PREFERRED_VARIANTS = {"pt": ["pt-BR", "pt-PT"]}
+
+# Código de idioma aceito, ex.: pt, en, es, pt-BR ou zh-Hans.
+LANGUAGE_CODE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{1,8})*")
+
+# Tamanho máximo de cada nome de pasta; o Windows limita caminhos a 260 caracteres.
+MAX_NAME_CHARS = 80
+
+# Início da linha do Markdown que informa a faixa usada.
+LABEL_PREFIX = "Legenda: "
 
 # Arquivos e pastas não podem conter estes caracteres.
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -33,7 +45,7 @@ PARAGRAPH_PAUSE = 1.5
 MAX_PARAGRAPH_CHARS = 400
 
 
-def safe_name(value: str, limit: int = 150) -> str:
+def safe_name(value: str, limit: int = MAX_NAME_CHARS) -> str:
     """Normaliza um nome para uso no sistema de arquivos."""
     value = INVALID_CHARS.sub("_", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
@@ -151,7 +163,13 @@ def build_paragraphs(cues: list[tuple[float, float, list[str]]]) -> list[str]:
     return paragraphs
 
 
-def write_markdown(srt_file: Path, md_file: Path, title: str, url: str | None) -> None:
+def write_markdown(
+    srt_file: Path,
+    md_file: Path,
+    title: str,
+    url: str | None,
+    label: str | None = None,
+) -> None:
     """Gera um Markdown com o texto completo da legenda, sem os tempos."""
     cues = parse_srt(srt_file.read_text(encoding="utf-8", errors="replace"))
     paragraphs = build_paragraphs(cues)
@@ -161,18 +179,79 @@ def write_markdown(srt_file: Path, md_file: Path, title: str, url: str | None) -
     if url:
         lines += [f"Fonte: {url}", ""]
 
+    if label:
+        lines += [f"{LABEL_PREFIX}{label}", ""]
+
     lines += ["\n\n".join(paragraphs), ""]
     md_file.write_text("\n".join(lines), encoding="utf-8")
 
 
-def download_portuguese_subtitle(
+def read_label(md_file: Path) -> str | None:
+    """Lê a faixa registrada em um Markdown gerado antes, se houver."""
+    if not md_file.exists():
+        return None
+
+    for line in md_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith(LABEL_PREFIX):
+            return line.removeprefix(LABEL_PREFIX)
+
+    return None
+
+
+def describe_track(video: dict, track: str) -> str:
+    """Descreve a faixa usada, ex.: 'Portuguese (Brazil), manual'."""
+    manual = video.get("subtitles") or {}
+    automatic = video.get("automatic_captions") or {}
+    formats = manual.get(track) or automatic.get(track) or [{}]
+    name = formats[0].get("name") or track
+    kind = "manual" if track in manual else "automática"
+    return f"{name}, {kind}"
+
+
+def choose_subtitle_track(video: dict, language: str) -> str | None:
+    """
+    Escolhe a faixa de legenda do vídeo para o idioma pedido. Manuais vêm
+    antes das automáticas. Entre as manuais, as variantes preferidas (pt-BR,
+    pt-PT) vêm antes do idioma exato. Entre as automáticas, o idioma exato e
+    a original (-orig) vêm antes das traduções.
+    """
+    manual = video.get("subtitles") or {}
+    automatic = video.get("automatic_captions") or {}
+    preferred = [code.lower() for code in PREFERRED_VARIANTS.get(language, [])]
+
+    def priority(key: str) -> tuple[int, int, int, str]:
+        code = key.lower()
+        position = preferred.index(code) if code in preferred else len(preferred)
+
+        if key in manual:
+            tier = 0
+        elif code == language or code.endswith("-orig"):
+            tier = 1
+        else:
+            tier = 2
+
+        return (tier, position, 0 if code == language else 1, code)
+
+    candidates = [
+        key
+        for key in [*manual, *automatic]
+        if key.lower() == language or key.lower().startswith(f"{language}-")
+    ]
+
+    return min(candidates, key=priority, default=None)
+
+
+def download_subtitle(
     video: dict,
     destination: Path,
     index: int,
+    language: str,
+    numbered: bool,
 ) -> bool:
     """
-    Baixa legendas em português, incluindo legendas automáticas
-    e faixas traduzidas que o YouTube disponibilizar em português.
+    Baixa a legenda no idioma escolhido, incluindo legendas automáticas
+    e faixas traduzidas que o YouTube disponibilizar nesse idioma.
+    Sem numeração (vídeo único), salva direto em destination.
     """
     title = safe_name(video.get("title") or f"Vídeo {index}")
     url = get_video_url(video)
@@ -183,17 +262,26 @@ def download_portuguese_subtitle(
         print("  [ERRO] Não foi possível identificar a URL do vídeo.")
         return False
 
-    video_dir = destination / f"{index:03d} - {title}"
-    video_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = destination / f"{index:03d} - {title}" if numbered else destination
 
-    final_file = video_dir / "legenda.srt"
-    text_file = video_dir / "legenda.md"
+    # O idioma padrão mantém os nomes antigos; os demais recebem o código.
+    suffix = "" if language == DEFAULT_LANGUAGE else f".{language}"
+    final_file = video_dir / f"legenda{suffix}.srt"
+    text_file = video_dir / f"legenda{suffix}.md"
 
     # Não refaz o download se a legenda já existir; apenas atualiza o texto.
     if final_file.exists() and final_file.stat().st_size > 0:
-        write_markdown(final_file, text_file, title, url)
+        write_markdown(final_file, text_file, title, url, read_label(text_file))
         print("  [OK] Legenda já existe; ignorando.")
         return True
+
+    track = choose_subtitle_track(video, language)
+
+    if not track:
+        print(f"  [SEM LEGENDA] Nenhuma legenda em '{language}'.")
+        return False
+
+    print(f"  Faixa escolhida: {track}")
 
     # Usa uma pasta temporária para não misturar arquivos de
     # idiomas diferentes ou resultados de tentativas anteriores.
@@ -210,12 +298,15 @@ def download_portuguese_subtitle(
             "sleep_requests": 3,
             "sleep_subtitles": 5,
 
+            # Sem barra de progresso, para não misturar com as mensagens.
+            "noprogress": True,
+
             # Legendas manuais e automáticas.
             "writesubtitles": True,
             "writeautomaticsub": True,
 
-            # Solicita somente idiomas portugueses.
-            "subtitleslangs": PORTUGUESE_LANGUAGES,
+            # Solicita somente a faixa escolhida.
+            "subtitleslangs": [re.escape(track)],
 
             # Prefere SRT; converte outro formato compatível.
             "subtitlesformat": "srt/best",
@@ -241,28 +332,16 @@ def download_portuguese_subtitle(
         candidates = find_srt(temp_dir)
 
         if not candidates:
-            print("  [SEM LEGENDA] Nenhuma legenda portuguesa em SRT.")
+            print(f"  [SEM LEGENDA] Nenhuma legenda em SRT para '{track}'.")
             return False
 
-        # Seleciona a variante mais próxima do português brasileiro.
-        def language_priority(path: Path) -> tuple[int, str]:
-            name = path.name.lower()
-
-            if "pt-br" in name or "pt_br" in name:
-                return (0, name)
-            if "pt-pt" in name or "pt_pt" in name:
-                return (1, name)
-            if re.search(r"\.pt(?:\.|$)", name):
-                return (2, name)
-
-            return (3, name)
-
-        selected = sorted(candidates, key=language_priority)[0]
-
         try:
+            # Cria a pasta só agora, quando já há legenda para salvar.
+            video_dir.mkdir(parents=True, exist_ok=True)
+
             # Copia para garantir que o arquivo temporário não
             # seja movido para fora do ciclo de vida da pasta.
-            shutil.copy2(selected, final_file)
+            shutil.copy2(candidates[0], final_file)
 
             if final_file.stat().st_size == 0:
                 final_file.unlink(missing_ok=True)
@@ -273,11 +352,74 @@ def download_portuguese_subtitle(
             print(f"  [ERRO] Não foi possível salvar o SRT: {exc}")
             return False
 
-    write_markdown(final_file, text_file, title, url)
+    write_markdown(final_file, text_file, title, url, describe_track(video, track))
 
     print(f"  [OK] {final_file}")
     print(f"  [OK] {text_file}")
     return True
+
+
+def normalize_language(value: str) -> str:
+    """Padroniza o idioma digitado; vazio vira o padrão."""
+    return value.strip().lower() or DEFAULT_LANGUAGE
+
+
+def show_languages(videos: list[dict]) -> None:
+    """Lista os idiomas com legenda manual ou original automática nos vídeos."""
+    counts: dict[str, int] = {}
+    names: dict[str, str] = {}
+    kinds: dict[str, str] = {}
+
+    for video in videos:
+        manual = video.get("subtitles") or {}
+        original = {
+            key: formats
+            for key, formats in (video.get("automatic_captions") or {}).items()
+            if key.endswith("-orig")
+        }
+
+        for kind, tracks in (("manual", manual), ("automática", original)):
+            for key, formats in tracks.items():
+                code = key.lower()
+                counts[code] = counts.get(code, 0) + 1
+                names.setdefault(code, (formats[0].get("name") if formats else None) or key)
+                kinds.setdefault(code, kind)
+
+    if not counts:
+        print("Nenhuma legenda manual ou original encontrada.")
+        return
+
+    print("\nIdiomas com legenda nos vídeos:")
+    order = sorted(counts, key=lambda code: (kinds[code] != "manual", -counts[code], code))
+
+    for code in order:
+        print(f"  {code:<10} {names[code]:<30} {kinds[code]:<10} {counts[code]}/{len(videos)} vídeos")
+
+
+def choose_language(videos: list[dict], given: str | None) -> str | None:
+    """
+    Pede o idioma até algum vídeo ter legenda nele. Com o idioma já informado
+    na linha de comando, não pergunta de novo.
+    """
+    while True:
+        answer = given if given is not None else input(
+            "Idioma das legendas (ex.: pt, en, es, pt-BR) [pt]: "
+        )
+        language = normalize_language(answer)
+
+        if not LANGUAGE_CODE.fullmatch(language):
+            print(f"Idioma inválido: {language}. Use um código como pt, en, es ou pt-BR.")
+        else:
+            found = sum(choose_subtitle_track(video, language) is not None for video in videos)
+
+            if found:
+                print(f"Legenda em '{language}' disponível em {found} de {len(videos)} vídeos.")
+                return language
+
+            print(f"Nenhum vídeo tem legenda em '{language}'.")
+
+        if given is not None:
+            return None
 
 
 def main() -> None:
@@ -291,6 +433,12 @@ def main() -> None:
 
     if not url:
         print("Nenhum link informado.")
+        return
+
+    given = normalize_language(sys.argv[2]) if len(sys.argv) > 2 else None
+
+    if given is not None and not LANGUAGE_CODE.fullmatch(given):
+        print(f"Idioma inválido: {given}. Use um código como pt, en, es ou pt-BR.")
         return
 
     print("Obtendo informações do YouTube...")
@@ -307,20 +455,28 @@ def main() -> None:
         print("Nenhum vídeo encontrado.")
         return
 
+    total = len(videos)
+    print(f"\nColeção: {collection}")
+    print(f"Vídeos encontrados: {total}")
+    show_languages(videos)
+
+    language = choose_language(videos, given)
+
+    if not language:
+        return
+
     destination = OUTPUT_DIR / collection
     destination.mkdir(parents=True, exist_ok=True)
 
-    total = len(videos)
+    numbered = total > 1
     successful = 0
     failed = []
 
-    print(f"\nColeção: {collection}")
-    print(f"Vídeos encontrados: {total}")
     print(f"Destino: {destination.resolve()}")
 
     for index, video in enumerate(videos, start=1):
         try:
-            if download_portuguese_subtitle(video, destination, index):
+            if download_subtitle(video, destination, index, language, numbered=numbered):
                 successful += 1
             else:
                 failed.append(video.get("title") or f"Vídeo {index}")
